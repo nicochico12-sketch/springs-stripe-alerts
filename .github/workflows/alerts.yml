@@ -25,7 +25,8 @@ jobs:
         env:
           COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
         run: |
-          composio login --user-api-key "$COMPOSIO_API_KEY" --yes --no-browser --no-skill-install
+          # --user-api-key is a self-contained direct-login path; it rejects browser/session flags
+          composio login --user-api-key "$COMPOSIO_API_KEY"
           composio whoami >/dev/null && echo "Composio auth OK"
 
       - name: Run payment alerts
