@@ -156,6 +156,17 @@ def main():
     succeeded = [c for c in charges
                  if c.get("status") == "succeeded" and c.get("paid")
                  and c.get("created", 0) >= cutoff]
+
+    if os.environ.get("ALERTS_DRYRUN") == "1":
+        who = subprocess.run([COMPOSIO_BIN, "whoami"], capture_output=True, text=True).stdout
+        diag("whoami:", " ".join(who.split())[-220:])
+        for c in succeeded:
+            # reversed so GitHub's secret-masking can't redact the value
+            diag("succ id(rev):", (c.get("id") or "")[::-1],
+                 "| pi(rev):", (c.get("payment_intent") or "")[::-1],
+                 "| receipt_tail:", (c.get("receipt_url") or "")[-28:])
+        print(f"DRYRUN: {len(succeeded)} succeeded charge(s); no posting")
+        return
     # never post a charge we can't dedup on
     usable = [c for c in succeeded if c.get("id")]
     if len(usable) != len(succeeded):

@@ -25,11 +25,13 @@ jobs:
         env:
           COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
         run: |
-          # --user-api-key is a self-contained direct-login path; it rejects browser/session flags
-          composio login --user-api-key "$COMPOSIO_API_KEY"
-          composio whoami >/dev/null && echo "Composio auth OK"
+          # --user-api-key is a self-contained direct-login path; pin org to match local context
+          composio login --user-api-key "$COMPOSIO_API_KEY" --org ok_npdCOmMXWGXM
+          echo "=== cloud whoami ===" && composio whoami
 
       - name: Run payment alerts
+        env:
+          ALERTS_DRYRUN: "1"   # TEMP: diagnose account context, no posting
         run: |
           export COMPOSIO_BIN="$HOME/.composio/composio"
           python3 stripe_payment_alerts.py
