@@ -1,0 +1,34 @@
+name: Stripe payment alerts → Slack
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 min (UTC; GitHub may delay under load — harmless, job self-heals)
+  workflow_dispatch: {}       # allow manual runs for testing
+
+concurrency:
+  group: stripe-alerts
+  cancel-in-progress: false   # never kill a run mid-post; dedup makes overlap safe anyway
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Composio CLI
+        run: |
+          curl -fsSL https://composio.dev/install | bash
+          echo "$HOME/.composio" >> "$GITHUB_PATH"
+
+      - name: Authenticate Composio (non-interactive)
+        env:
+          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
+        run: |
+          composio login --user-api-key "$COMPOSIO_API_KEY" --yes --no-browser --no-skill-install
+          composio whoami >/dev/null && echo "Composio auth OK"
+
+      - name: Run payment alerts
+        run: |
+          export COMPOSIO_BIN="$HOME/.composio/composio"
+          python3 stripe_payment_alerts.py
