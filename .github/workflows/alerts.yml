@@ -30,8 +30,6 @@ jobs:
           echo "=== cloud whoami ===" && composio whoami
 
       - name: Run payment alerts
-        env:
-          ALERTS_DRYRUN: "1"   # TEMP: diagnose account context, no posting
         run: |
           export COMPOSIO_BIN="$HOME/.composio/composio"
           python3 stripe_payment_alerts.py
