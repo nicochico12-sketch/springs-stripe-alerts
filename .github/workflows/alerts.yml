@@ -33,6 +33,4 @@ jobs:
           echo "=== cloud whoami ===" && composio whoami
 
       - name: Run payment alerts
-        env:
-          ALERTS_DRYRUN: "1"   # TEMP: verify context on 0.2.28 bare login (no posting)
         run: python3 stripe_payment_alerts.py
