@@ -16,21 +16,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Composio CLI (pinned via npm)
+      - name: Install Composio CLI
         run: |
-          # PIN 0.2.27: 0.2.28's `login --org` regressed to HTTP 404. The binary
-          # installer can't pin tags containing "/", but npm pins cleanly.
-          npm install -g @composio/cli@0.2.27
-          echo "$(npm config get prefix)/bin" >> "$GITHUB_PATH"
-          composio --version
+          # NOTE: 0.2.27's linux binary was removed from releases and @composio/cli
+          # isn't on npm, so we can't pin — only the latest GitHub-release binary works.
+          curl -fsSL https://composio.dev/install | bash
+          echo "$HOME/.composio" >> "$GITHUB_PATH"
 
       - name: Authenticate Composio (non-interactive)
         env:
           COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
         run: |
-          # --user-api-key is a self-contained direct-login path; pin org to match local context
-          composio login --user-api-key "$COMPOSIO_API_KEY" --org ok_npdCOmMXWGXM
+          # Bare login: 0.2.28's `--org` flag returns HTTP 404; the API key's default
+          # org (ok_npdCOmMXWGXM) is correct without it. Dedup/enrichment are org-agnostic.
+          composio login --user-api-key "$COMPOSIO_API_KEY"
           echo "=== cloud whoami ===" && composio whoami
 
       - name: Run payment alerts
-        run: python3 stripe_payment_alerts.py   # COMPOSIO_BIN defaults to "composio" (on PATH via npm)
+        env:
+          ALERTS_DRYRUN: "1"   # TEMP: verify context on 0.2.28 bare login (no posting)
+        run: python3 stripe_payment_alerts.py
