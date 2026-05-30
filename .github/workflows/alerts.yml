@@ -3,7 +3,12 @@ name: Stripe payment alerts → Slack
 on:
   schedule:
     - cron: "*/15 * * * *"   # every 15 min (UTC; GitHub may delay under load — harmless, job self-heals)
-  workflow_dispatch: {}       # allow manual runs for testing
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Simulate a failure (to test the Slack failure alert)"
+        type: boolean
+        default: false
 
 concurrency:
   group: stripe-alerts
@@ -33,4 +38,24 @@ jobs:
           echo "=== cloud whoami ===" && composio whoami
 
       - name: Run payment alerts
-        run: python3 stripe_payment_alerts.py
+        run: |
+          if [ "${{ inputs.force_fail }}" = "true" ]; then
+            echo "force_fail=true → simulating a failure to test the alert"; exit 1
+          fi
+          python3 stripe_payment_alerts.py
+
+      # Safety net: if ANY step above failed, post a heads-up into the channel so a
+      # silent breakage never hides incoming payments. Best-effort (bare login works
+      # even through the kind of CLI drift we hit); GitHub also emails on failure.
+      - name: Alert Slack on failure
+        if: failure()
+        env:
+          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
+        run: |
+          command -v composio >/dev/null 2>&1 || { curl -fsSL https://composio.dev/install | bash; export PATH="$HOME/.composio:$PATH"; }
+          composio login --user-api-key "$COMPOSIO_API_KEY" >/dev/null 2>&1 || true
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat > /tmp/fail.json <<EOF
+          {"channel":"C0B6FENKU2K","unfurl_links":false,"markdown_text":":warning: *Payment alerts run FAILED.* New Stripe payments may not be posted until this is fixed.\n<$RUN_URL|View the failed run> · then re-run once resolved (the 72h backfill will catch anything missed)."}
+          EOF
+          composio execute SLACK_SEND_MESSAGE -d @/tmp/fail.json || echo "WARN: failure alert could not post (GitHub email still sent)"
