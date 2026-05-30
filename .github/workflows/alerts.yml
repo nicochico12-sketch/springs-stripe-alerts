@@ -18,7 +18,9 @@ jobs:
 
       - name: Install Composio CLI
         run: |
-          curl -fsSL https://composio.dev/install | bash
+          # PIN the version: 0.2.28 regressed — `composio login --org` returns HTTP 404.
+          # The installer takes a version-tag arg; pass it through the pipe.
+          curl -fsSL https://composio.dev/install | bash -s -- "@composio/cli@0.2.27"
           echo "$HOME/.composio" >> "$GITHUB_PATH"
 
       - name: Authenticate Composio (non-interactive)
