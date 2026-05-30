@@ -16,12 +16,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Composio CLI
+      - name: Install Composio CLI (pinned via npm)
         run: |
-          # PIN the version: 0.2.28 regressed — `composio login --org` returns HTTP 404.
-          # The installer takes a version-tag arg; pass it through the pipe.
-          curl -fsSL https://composio.dev/install | bash -s -- "@composio/cli@0.2.27"
-          echo "$HOME/.composio" >> "$GITHUB_PATH"
+          # PIN 0.2.27: 0.2.28's `login --org` regressed to HTTP 404. The binary
+          # installer can't pin tags containing "/", but npm pins cleanly.
+          npm install -g @composio/cli@0.2.27
+          echo "$(npm config get prefix)/bin" >> "$GITHUB_PATH"
+          composio --version
 
       - name: Authenticate Composio (non-interactive)
         env:
@@ -32,6 +33,4 @@ jobs:
           echo "=== cloud whoami ===" && composio whoami
 
       - name: Run payment alerts
-        run: |
-          export COMPOSIO_BIN="$HOME/.composio/composio"
-          python3 stripe_payment_alerts.py
+        run: python3 stripe_payment_alerts.py   # COMPOSIO_BIN defaults to "composio" (on PATH via npm)
