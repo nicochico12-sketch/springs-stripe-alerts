@@ -102,6 +102,30 @@ def enrich(charge):
             "email": bd.get("email") or charge.get("receipt_email") or "—",
             "receipt": charge.get("receipt_url"),
             "method": (charge.get("payment_method_details", {}) or {}).get("type") or "—"}
+    # Subscription / invoice charges have NO checkout session — their item, email, and
+    # payer name live on the INVOICE instead (the invoice id survives redaction). Without
+    # this branch they'd post with blank "Item:" and "Email:" fields.
+    inv = charge.get("invoice")
+    if inv and inv != REDACTED:
+        try:
+            iv = execute("STRIPE_GET_INVOICES_INVOICE", {"invoice": inv})
+            names = [ln.get("description")
+                     for ln in ((iv.get("lines") or {}).get("data") or [])
+                     if ln.get("description")]
+            if names:
+                info["item"] = ", ".join(names)
+            if iv.get("customer_email"):
+                info["email"] = iv["customer_email"]
+            cname = iv.get("customer_name")
+            if cname:
+                if info["payer"] == "—":
+                    info["payer"] = cname
+                elif cname != info["payer"]:
+                    info["org"] = cname
+        except Exception as e:
+            diag(f"enrich invoice {inv}: {e}")
+        return info
+
     pi = charge.get("payment_intent")
     if not pi or pi == REDACTED:
         return info
