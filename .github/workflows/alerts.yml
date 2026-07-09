@@ -25,7 +25,15 @@ jobs:
         run: |
           # NOTE: 0.2.27's linux binary was removed from releases and @composio/cli
           # isn't on npm, so we can't pin — only the latest GitHub-release binary works.
-          curl -fsSL https://composio.dev/install | bash
+          # Shared runner IPs get rate-limited (HTTP 429) on this download; without
+          # retries a blip kills the run (2026-07-08). curl retries the download,
+          # the loop retries the installer script itself.
+          for attempt in 1 2 3; do
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 https://composio.dev/install | bash && break
+            echo "install attempt $attempt failed; retrying in 15s"
+            sleep 15
+          done
+          "$HOME/.composio/composio" --version   # hard-fail HERE if install never succeeded
           echo "$HOME/.composio" >> "$GITHUB_PATH"
 
       - name: Authenticate Composio (non-interactive)
@@ -52,7 +60,7 @@ jobs:
         env:
           COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
         run: |
-          command -v composio >/dev/null 2>&1 || { curl -fsSL https://composio.dev/install | bash; export PATH="$HOME/.composio:$PATH"; }
+          command -v composio >/dev/null 2>&1 || { curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 https://composio.dev/install | bash; export PATH="$HOME/.composio:$PATH"; }
           composio login --user-api-key "$COMPOSIO_API_KEY" >/dev/null 2>&1 || true
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           cat > /tmp/fail.json <<EOF
