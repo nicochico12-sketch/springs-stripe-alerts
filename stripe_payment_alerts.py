@@ -5,33 +5,35 @@ Stripe -> Slack enriched payment alerts for Springs Pickleball.
 Posts enriched alerts (amount, item/tier, payer, organization, email, receipt) to
 the #stripepayment Slack channel for each new SUCCEEDED Stripe payment.
 
+Talks to Stripe and Slack directly (stdlib only — no CLI, no pip installs):
+  - STRIPE_API_KEY: a RESTRICTED key, read-only on Charges, Checkout Sessions,
+    and Invoices. Nothing else. It cannot move money.
+  - SLACK_BOT_TOKEN: the payroll_helper bot. Needs chat:write + groups:history
+    and membership in #stripepayment (private channel).
+
 Robustness notes (learned the hard way):
-  - Composio redacts the `id` field of `charge` and `checkout.session` objects in this
-    account, but NOT `payment_intent`, `receipt_url`, or `payment_link`. So:
-      * dedup keys on the PAYMENT INTENT (pi_...), which is always present & stable.
-      * the item/tier is fetched via the PAYMENT LINK's line items (not the session id).
   - FAIL-CLOSED dedup: if the channel can't be read, abort rather than risk duplicates.
   - Charges with no stable key are skipped (never post something we can't dedup).
   - Idempotent: the channel itself is the dedup state (each post embeds "Ref <pi>").
-
-Requires: the `composio` CLI authenticated with Stripe + Slack connected.
 """
 
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-COMPOSIO_BIN = os.environ.get("COMPOSIO_BIN", "composio")
 CHANNEL = "C0B6FENKU2K"          # #stripepayment
 LOOKBACK_HOURS = 72
 CHARGE_SCAN = 25
 HISTORY_SCAN = 60
 DEBUG = os.environ.get("ALERTS_DEBUG", "1") == "1"
 DRYRUN = os.environ.get("ALERTS_DRYRUN") == "1"
-REDACTED = "<REDACTED>"
+
+STRIPE_KEY = os.environ.get("STRIPE_API_KEY", "")
+SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 
 
 def diag(*a):
@@ -39,38 +41,48 @@ def diag(*a):
         print("[diag]", *a, file=sys.stderr)
 
 
-def execute(slug, payload):
-    """Run a Composio tool; return the provider payload dict (handles file offload)."""
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(payload, f)
-        path = f.name
-    proc = subprocess.run([COMPOSIO_BIN, "execute", slug, "-d", f"@{path}"],
-                          capture_output=True, text=True)
-    out = proc.stdout
-    i = out.find("{")
-    if i == -1:
-        raise RuntimeError(f"{slug}: no JSON output:\n{out[:400]}\n{proc.stderr[:400]}")
-    top = json.loads(out[i:])
-    if not top.get("successful", True):
-        raise RuntimeError(f"{slug} failed: {top.get('error') or top.get('data')}")
-    body = top.get("data")
-    fp = top.get("outputFilePath")
-    if fp and (not body or (isinstance(body, dict) and not body)):
-        with open(fp) as fh:
-            body = json.load(fh)
-        if isinstance(body, dict) and "successful" in body and "data" in body:
-            body = body["data"]
-    return body if isinstance(body, dict) else {}
+def _http(url, headers, data=None, attempts=3):
+    """GET/POST JSON with retries on transient failures (5xx, 429, network)."""
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:400]
+            if e.code in (429, 500, 502, 503, 504) and attempt < attempts:
+                diag(f"HTTP {e.code} from {url.split('?')[0]}; retry {attempt}/{attempts}")
+                time.sleep(5 * attempt)
+                continue
+            raise RuntimeError(f"HTTP {e.code} {url.split('?')[0]}: {body}") from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < attempts:
+                diag(f"network error {e}; retry {attempt}/{attempts}")
+                time.sleep(5 * attempt)
+                continue
+            raise
 
 
-def data_list(body):
-    d = body.get("data")
-    return d if isinstance(d, list) else []
+def stripe_get(path, **params):
+    url = f"https://api.stripe.com/v1/{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return _http(url, {"Authorization": f"Bearer {STRIPE_KEY}"})
+
+
+def slack_call(method, payload):
+    body = _http(f"https://slack.com/api/{method}",
+                 {"Authorization": f"Bearer {SLACK_TOKEN}",
+                  "Content-Type": "application/json; charset=utf-8"},
+                 data=json.dumps(payload).encode())
+    if not body.get("ok"):
+        raise RuntimeError(f"slack {method} failed: {body.get('error')}")
+    return body
 
 
 def posted_keys():
     """Payment-intent / charge refs already announced. FAIL-CLOSED on read failure."""
-    body = execute("SLACK_FETCH_CONVERSATION_HISTORY", {"channel": CHANNEL, "limit": HISTORY_SCAN})
+    body = slack_call("conversations.history", {"channel": CHANNEL, "limit": HISTORY_SCAN})
     msgs = body.get("messages")
     if not isinstance(msgs, list) or len(msgs) == 0:
         raise RuntimeError("dedup read returned no messages — aborting to avoid duplicates")
@@ -88,12 +100,8 @@ def posted_keys():
 
 
 def charge_key(charge):
-    """Stable dedup key: prefer payment_intent (never redacted); else a real charge id."""
-    pi = charge.get("payment_intent")
-    if pi and pi != REDACTED:
-        return pi
-    cid = charge.get("id")
-    return cid if cid and cid != REDACTED else None
+    """Stable dedup key: prefer payment_intent; else the charge id."""
+    return charge.get("payment_intent") or charge.get("id")
 
 
 def enrich(charge):
@@ -103,12 +111,12 @@ def enrich(charge):
             "receipt": charge.get("receipt_url"),
             "method": (charge.get("payment_method_details", {}) or {}).get("type") or "—"}
     # Subscription / invoice charges have NO checkout session — their item, email, and
-    # payer name live on the INVOICE instead (the invoice id survives redaction). Without
-    # this branch they'd post with blank "Item:" and "Email:" fields.
+    # payer name live on the INVOICE instead. Without this branch they'd post with
+    # blank "Item:" and "Email:" fields.
     inv = charge.get("invoice")
-    if inv and inv != REDACTED:
+    if inv:
         try:
-            iv = execute("STRIPE_GET_INVOICES_INVOICE", {"invoice": inv})
+            iv = stripe_get(f"invoices/{inv}")
             names = [ln.get("description")
                      for ln in ((iv.get("lines") or {}).get("data") or [])
                      if ln.get("description")]
@@ -127,11 +135,11 @@ def enrich(charge):
         return info
 
     pi = charge.get("payment_intent")
-    if not pi or pi == REDACTED:
+    if not pi:
         return info
     try:
-        sessions = data_list(execute("STRIPE_LIST_CHECKOUT_SESSIONS",
-                                     {"payment_intent": pi, "limit": 1}))
+        sessions = (stripe_get("checkout/sessions", payment_intent=pi, limit=1)
+                    .get("data") or [])
         if not sessions:
             diag(f"enrich {pi}: no checkout session")
             return info
@@ -142,22 +150,8 @@ def enrich(charge):
         if cd.get("business_name") and cd["business_name"] != info["payer"]:
             info["org"] = cd["business_name"]
         info["email"] = cd.get("email") or info["email"]
-        # Item/tier via the PAYMENT LINK (its id survives redaction; the session id does not).
-        plink = s.get("payment_link")
-        names = []
-        if plink and plink != REDACTED:
-            items = data_list(execute("STRIPE_GET_PAYMENT_LINKS_PAYMENT_LINK_LINE_ITEMS",
-                                      {"payment_link": plink}))
-            names = [it.get("description") for it in items if it.get("description")]
-        if not names:  # fallback: line items by session id (works when id isn't redacted)
-            sid = s.get("id")
-            if sid and sid != REDACTED:
-                try:
-                    items = data_list(execute("STRIPE_GET_CHECKOUT_SESSIONS_SESSION_LINE_ITEMS",
-                                              {"session": sid}))
-                    names = [it.get("description") for it in items if it.get("description")]
-                except Exception as e:
-                    diag(f"enrich {pi}: session line-items fallback failed: {e}")
+        items = (stripe_get(f"checkout/sessions/{s['id']}/line_items").get("data") or [])
+        names = [it.get("description") for it in items if it.get("description")]
         if names:
             info["item"] = ", ".join(names)
     except Exception as e:
@@ -175,15 +169,20 @@ def build_message(charge, info, key):
              f"*Item:* {info['item']}", f"*From:* {frm}", f"*Email:* {info['email']}",
              f"*Date:* <!date^{created}^{{date_long_pretty}} at {{time}}|payment received>",
              f"*Method:* {method}"]
-    if info["receipt"] and info["receipt"] != REDACTED:
+    if info["receipt"]:
         lines.append(f"*Receipt:* <{info['receipt']}|View Stripe receipt>")
     lines += ["", f"_Ref {key}_"]
     return "\n".join(lines)
 
 
 def main():
+    missing = [n for n, v in (("STRIPE_API_KEY", STRIPE_KEY),
+                              ("SLACK_BOT_TOKEN", SLACK_TOKEN)) if not v]
+    if missing:
+        sys.exit(f"missing env: {', '.join(missing)}")
+
     cutoff = time.time() - LOOKBACK_HOURS * 3600
-    charges = data_list(execute("STRIPE_LIST_CHARGES", {"limit": CHARGE_SCAN}))
+    charges = stripe_get("charges", limit=CHARGE_SCAN).get("data") or []
     succeeded = [c for c in charges
                  if c.get("status") == "succeeded" and c.get("paid")
                  and c.get("created", 0) >= cutoff]
@@ -209,8 +208,9 @@ def main():
 
     for charge, key in sorted(new, key=lambda ck: ck[0].get("created", 0)):
         info = enrich(charge)
-        execute("SLACK_SEND_MESSAGE", {"channel": CHANNEL, "markdown_text": build_message(charge, info, key),
-                                       "unfurl_links": False, "unfurl_media": False})
+        slack_call("chat.postMessage", {"channel": CHANNEL,
+                                        "text": build_message(charge, info, key),
+                                        "unfurl_links": False, "unfurl_media": False})
         print(f"posted ${(charge.get('amount', 0) or 0) / 100:.2f} {info['payer']} / {info['item']}")
     if not new:
         print("nothing new to post.")

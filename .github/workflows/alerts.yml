@@ -5,6 +5,10 @@ on:
     - cron: "*/15 * * * *"   # every 15 min (UTC; GitHub may delay under load — harmless, job self-heals)
   workflow_dispatch:
     inputs:
+      dryrun:
+        description: "Dry run (enrich + print, no Slack posts)"
+        type: boolean
+        default: false
       force_fail:
         description: "Simulate a failure (to test the Slack failure alert)"
         type: boolean
@@ -21,49 +25,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Composio CLI
-        run: |
-          # NOTE: 0.2.27's linux binary was removed from releases and @composio/cli
-          # isn't on npm, so we can't pin — only the latest GitHub-release binary works.
-          # Shared runner IPs get rate-limited (HTTP 429) on this download; without
-          # retries a blip kills the run (2026-07-08). curl retries the download,
-          # the loop retries the installer script itself.
-          for attempt in 1 2 3; do
-            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 https://composio.dev/install | bash && break
-            echo "install attempt $attempt failed; retrying in 15s"
-            sleep 15
-          done
-          "$HOME/.composio/composio" --version   # hard-fail HERE if install never succeeded
-          echo "$HOME/.composio" >> "$GITHUB_PATH"
-
-      - name: Authenticate Composio (non-interactive)
-        env:
-          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
-        run: |
-          # Bare login: 0.2.28's `--org` flag returns HTTP 404; the API key's default
-          # org (ok_npdCOmMXWGXM) is correct without it. Dedup/enrichment are org-agnostic.
-          composio login --user-api-key "$COMPOSIO_API_KEY"
-          echo "=== cloud whoami ===" && composio whoami
-
+      # No installs: the script is stdlib-only and calls Stripe + Slack REST APIs
+      # directly. (The old Composio CLI install step was the source of every
+      # failure Jul 7–16 — installer flakes on shared-runner IPs.)
       - name: Run payment alerts
+        env:
+          STRIPE_API_KEY: ${{ secrets.STRIPE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          ALERTS_DRYRUN: ${{ inputs.dryrun == true && '1' || '' }}
         run: |
           if [ "${{ inputs.force_fail }}" = "true" ]; then
             echo "force_fail=true → simulating a failure to test the alert"; exit 1
           fi
           python3 stripe_payment_alerts.py
 
-      # Safety net: if ANY step above failed, post a heads-up into the channel so a
-      # silent breakage never hides incoming payments. Best-effort (bare login works
-      # even through the kind of CLI drift we hit); GitHub also emails on failure.
+      # Safety net: if the run failed, post a heads-up into the channel so a
+      # silent breakage never hides incoming payments. GitHub also emails on failure.
       - name: Alert Slack on failure
         if: failure()
         env:
-          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
-          command -v composio >/dev/null 2>&1 || { curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 https://composio.dev/install | bash; export PATH="$HOME/.composio:$PATH"; }
-          composio login --user-api-key "$COMPOSIO_API_KEY" >/dev/null 2>&1 || true
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          cat > /tmp/fail.json <<EOF
-          {"channel":"C0B6FENKU2K","unfurl_links":false,"markdown_text":":warning: *Payment alerts run FAILED.* New Stripe payments may not be posted until this is fixed.\n<$RUN_URL|View the failed run> · then re-run once resolved (the 72h backfill will catch anything missed)."}
-          EOF
-          composio execute SLACK_SEND_MESSAGE -d @/tmp/fail.json || echo "WARN: failure alert could not post (GitHub email still sent)"
+          curl -sS --retry 3 https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "{\"channel\":\"C0B6FENKU2K\",\"unfurl_links\":false,\"text\":\":warning: *Payment alerts run FAILED.* New Stripe payments may not be posted until this is fixed.\n<$RUN_URL|View the failed run> · then re-run once resolved (the 72h backfill will catch anything missed).\"}" \
+            || echo "WARN: failure alert could not post (GitHub email still sent)"
