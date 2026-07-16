@@ -189,6 +189,17 @@ def main():
     diag(f"pulled {len(charges)} charges; {len(succeeded)} succeeded in window")
 
     if DRYRUN:
+        # Scope self-check: probe every endpoint the enrichers need, so a
+        # mis-scoped restricted key surfaces here instead of as a degraded
+        # post ("Item: —") when the next real payment lands.
+        for label, probe in [("checkout_sessions", lambda: stripe_get("checkout/sessions", limit=1)),
+                             ("invoices", lambda: stripe_get("invoices", limit=1)),
+                             ("slack_history", posted_keys)]:
+            try:
+                probe()
+                print(f"scope-check {label}: OK")
+            except Exception as e:
+                print(f"scope-check {label}: FAILED — {e}")
         for c in succeeded:
             info = enrich(c)
             diag(f"DRYRUN charge: key={charge_key(c)} amount=${(c.get('amount',0) or 0)/100:.2f} "
