@@ -1,8 +1,14 @@
 name: Stripe payment alerts → Slack
 
 on:
+  # The real clock is Supabase pg_cron (project springs-marketing), which starts
+  # this workflow via workflow_dispatch every 5 min — see the springs-marketing
+  # repo, supabase/functions/scheduler/README.md. GitHub throttles `schedule` on
+  # this account to ~6-7 runs a day whatever cadence is asked for, so this cron
+  # is only the backup: it keeps payments flowing (slowly) if the Supabase clock
+  # stops, and its runs check that the clock is still ticking (last step).
   schedule:
-    - cron: "*/15 * * * *"   # every 15 min (UTC; GitHub may delay under load — harmless, job self-heals)
+    - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
       dryrun:
@@ -17,6 +23,10 @@ on:
 concurrency:
   group: stripe-alerts
   cancel-in-progress: false   # never kill a run mid-post; dedup makes overlap safe anyway
+
+permissions:
+  contents: read   # checkout
+  actions: read    # the clock check reads this workflow's run history
 
 jobs:
   alert:
@@ -39,10 +49,45 @@ jobs:
           fi
           python3 stripe_payment_alerts.py
 
+      # Dead-man check for the Supabase clock. If pg_cron stops dispatching
+      # (token expired, project paused), nothing inside Supabase can say so —
+      # but these backup runs can. Scheduled runs only, and after the alerts
+      # step, so payments still post before it complains.
+      - name: Supabase clock is ticking
+        id: deadman
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          MAX_AGE_MIN: "30"   # dispatched every 5 min; allow a few misses
+        run: |
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/alerts.yml/runs?event=workflow_dispatch&per_page=1" \
+                   --jq '.workflow_runs[0].created_at // empty')
+          if [ -n "$last" ]; then
+            age=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 60 ))
+            if [ "$age" -le "$MAX_AGE_MIN" ]; then
+              echo "last dispatched run $age min ago — Supabase clock OK"; exit 0
+            fi
+            why="the last dispatched run was $age min ago"
+          else
+            why="there are no dispatched runs at all"
+          fi
+          echo "::error::Supabase scheduler looks stopped: $why"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          text=":warning: *Payment alerts are running late.* The Supabase scheduler that starts them every 5 min looks stopped ($why), so new payments only post every few hours until it's fixed. Most likely the dispatch token expired: replace \`scheduler_github_token\` in Supabase Vault (project springs-marketing). <$RUN_URL|View run>"
+          jq -n --arg text "$text" '{channel: "C0B6FENKU2K", unfurl_links: false, text: $text}' \
+            | curl -sS --retry 3 https://slack.com/api/chat.postMessage \
+                -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                -H "Content-Type: application/json; charset=utf-8" \
+                --data @- \
+            || echo "WARN: late-alerts warning could not post (GitHub email still sent)"
+          exit 1
+
       # Safety net: if the run failed, post a heads-up into the channel so a
       # silent breakage never hides incoming payments. GitHub also emails on failure.
+      # (A failed clock check already posted its own, more specific warning.)
       - name: Alert Slack on failure
-        if: failure()
+        if: failure() && steps.deadman.outcome != 'failure'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
